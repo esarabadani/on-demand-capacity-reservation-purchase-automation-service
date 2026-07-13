@@ -1,0 +1,27 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Azure/azure-dev/main/schemas/v1.0/azure.yaml.json
+#
+# azure.yaml
+#
+# This file is read by the Azure Developer CLI (`azd`). It describes:
+#   - which infra tool to use (terraform in ./infra)
+#   - which services (=deployable apps) exist and where their code lives
+#
+# On `azd up`, azd:
+#   1. runs `terraform apply` in ./infra
+#   2. reads outputs, finds the Function App tagged azd-service-name=api
+#      (see infra/main.tf), and publishes ./src to it.
+
+name: capacity-reservation-bot
+metadata:
+  template: capacity-reservation-bot@1.0.0
+
+infra:
+  provider: terraform       # switch to `bicep` if you'd rather use Bicep
+  path: infra               # folder that holds main.tf / providers.tf / etc.
+  module: main              # entry file (main.tf)
+
+services:
+  api:                      # logical service name; matches azd-service-name tag
+    project: ./src          # folder that holds function_app.py + host.json
+    language: python
+    host: function          # Azure Functions host (not App Service / ACA / ...)

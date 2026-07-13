@@ -1,0 +1,12 @@
+# Files listed here are EXCLUDED from the deployment package that Azure
+# Functions Core Tools / azd builds when publishing this app. Anything not
+# needed at runtime should be added here to keep the package small and to
+# avoid leaking local files.
+
+.venv                     # local virtualenv folder
+__pycache__               # Python bytecode cache
+*.pyc                     # compiled Python files
+.python_packages          # legacy build output folder
+local.settings.json       # local-only config (secrets/subscription id)
+tests                     # unit tests are not needed at runtime
+.pytest_cache             # pytest cache dir
