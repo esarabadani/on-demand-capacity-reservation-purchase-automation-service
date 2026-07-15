@@ -1,0 +1,9 @@
+# Force LF line endings for shell scripts. Bash reads CRLF as `\r`
+# character in the shebang and fails with "bad interpreter" on Linux.
+*.sh   text eol=lf
+*.ps1  text eol=lf
+
+# Systemd unit files must also be LF.
+*.service text eol=lf
+*.timer   text eol=lf
+*.conf    text eol=lf
