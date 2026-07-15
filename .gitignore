@@ -1,24 +1,16 @@
-# Python
-.venv/
-__pycache__/
-*.pyc
-.python_packages/
-
-# Local-only Function settings (may contain subscription ids).
-src/local.settings.json
-
-# azd state and env files.
-.azure/
-
-# VS Code personal settings.
-.vscode/
-
-# Ad-hoc log files.
-*.log
-
 # Terraform
 infra/.terraform/
 infra/.terraform.lock.hcl
 infra/*.tfstate
 infra/*.tfstate.*
 infra/*.tfplan
+
+# azd (from previous incarnation)
+.azure/
+
+# Editor / OS
+.vscode/
+*.log
+
+# Local settings
+*.local

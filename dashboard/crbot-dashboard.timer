@@ -1,0 +1,12 @@
+# Fire the dashboard renderer once at boot, then every 60 seconds.
+
+[Unit]
+Description=Trigger Capacity Reservation Dashboard rendering every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+Unit=crbot-dashboard.service
+
+[Install]
+WantedBy=timers.target

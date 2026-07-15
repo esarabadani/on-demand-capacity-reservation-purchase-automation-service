@@ -1,44 +1,57 @@
 # =============================================================================
 # outputs.tf
-#
-# Values exported by this Terraform module.
-#
-# azd reads outputs whose names are ALL_UPPER_SNAKE_CASE and copies them into
-# the environment (`azd env get-values`) so you can pipe them into follow-up
-# commands. Anything you'd want to know after `azd up` finishes goes here.
 # =============================================================================
 
-output "AZURE_LOCATION" {
-  description = "Region the app was deployed to."
-  value       = var.location
+output "AUTOMATION_ACCOUNT" {
+  description = "Automation Account holding the runbook and job history."
+  value       = azurerm_automation_account.aa.name
 }
 
 output "AZURE_RESOURCE_GROUP" {
-  description = "Resource group holding the Function App and its dependencies."
+  description = "Resource group holding the Automation Account (and the new VM, if any)."
   value       = azurerm_resource_group.app.name
 }
 
 output "RESERVATIONS_RESOURCE_GROUP" {
-  description = "Resource group holding the Capacity Reservation Group and reservations."
+  description = "Resource group holding the Capacity Reservation Groups."
   value       = azurerm_resource_group.reservations.name
 }
 
-output "FUNCTION_APP_NAME" {
-  description = "Name of the Function App running the bot."
-  value       = azurerm_function_app_flex_consumption.func.name
-}
-
-output "FUNCTION_APP_URL" {
-  description = "Base URL of the Function App."
-  value       = "https://${azurerm_function_app_flex_consumption.func.default_hostname}"
-}
-
+# ---------------- Outputs for the NEW-VM path -------------------------------
 output "DASHBOARD_URL" {
-  description = "Direct link to the dashboard endpoint."
-  value       = "https://${azurerm_function_app_flex_consumption.func.default_hostname}/api/dashboard"
+  description = "Dashboard URL when Terraform created the VM. Empty when use_existing_vm=true."
+  value       = var.use_existing_vm ? "" : "http://${azurerm_public_ip.vm[0].ip_address}/"
 }
 
-output "STORAGE_ACCOUNT_NAME" {
-  description = "Storage account that holds the state tables and deployment package."
-  value       = azurerm_storage_account.sa.name
+output "DASHBOARD_PUBLIC_IP" {
+  description = "Public IP of the new VM. Empty when use_existing_vm=true."
+  value       = var.use_existing_vm ? "" : azurerm_public_ip.vm[0].ip_address
+}
+
+output "DASHBOARD_SSH" {
+  description = "SSH command for the new VM. Empty when use_existing_vm=true."
+  value       = var.use_existing_vm ? "" : "ssh ${var.dashboard_admin_username}@${azurerm_public_ip.vm[0].ip_address}"
+}
+
+# ---------------- Outputs for the EXISTING-VM path --------------------------
+# The customer copy-pastes this command into Cloud Shell. It downloads the
+# bootstrap script and runs it on the target VM via `az vm run-command`.
+output "BOOTSTRAP_COMMAND" {
+  description = "Cloud Shell command to install nginx + PowerShell + the dashboard on your existing VM. Empty when use_existing_vm=false."
+  value = var.use_existing_vm ? trimspace(<<-EOT
+    curl -fsSL ${local.bootstrap_repo_raw}/dashboard/bootstrap-vm.sh -o /tmp/crbot-bootstrap.sh && \
+    az vm run-command invoke \
+      --ids ${var.existing_vm_resource_id} \
+      --command-id RunShellScript \
+      --scripts @/tmp/crbot-bootstrap.sh \
+      --parameters \
+        CR_SUB_ID=${data.azurerm_client_config.current.subscription_id} \
+        CR_RES_RG=${azurerm_resource_group.reservations.name} \
+        CR_GROUP_PREFIX=${var.capacity_reservation_group_prefix} \
+        CR_DEFAULT_REGION=${var.reservations_location} \
+        CR_AUTOMATION_RG=${azurerm_resource_group.app.name} \
+        CR_AUTOMATION_ACCOUNT=${local.automation_account_name} \
+        CR_RUNBOOK_NAME=${local.runbook_name}
+  EOT
+  ) : ""
 }

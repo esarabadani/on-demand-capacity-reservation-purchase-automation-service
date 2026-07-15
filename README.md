@@ -1,10 +1,8 @@
-# Capacity Reservation Bot
+# On-Demand Capacity Reservation Purchase Automation Service
 
-An Azure automation that tries to buy **On-Demand Capacity Reservations** every hour, degrading gracefully to smaller quantities when Azure can't fulfil the full amount. Keeps state, shows a dashboard, and remembers progress across restarts.
+A hands-off Azure automation that **buys on-demand capacity reservations every hour** using a halving-degrade strategy — great for scarce VM SKUs in tight regions. Ships with a small web dashboard you can host on a brand-new VM the tool creates for you, **or on an Ubuntu VM you already own**.
 
-Built for the scenario:
-
-> "I want 50 × `Standard_NV6ads_A10_v5` and 9 × `Standard_NV18ads_A10_v5` in West Europe, but the region is tight so a single big request always fails."
+Everything installs from **Azure Cloud Shell** — no local tooling required. Only prerequisites are `git`, `terraform`, `az` (all preinstalled in Cloud Shell).
 
 ---
 
@@ -12,338 +10,347 @@ Built for the scenario:
 
 - [What it does](#what-it-does)
 - [Architecture](#architecture)
-- [The buying strategy (halving degrade)](#the-buying-strategy-halving-degrade)
-- [Repo layout](#repo-layout)
 - [Prerequisites](#prerequisites)
-- [Deploy](#deploy)
-- [Configure](#configure)
-- [Using it](#using-it)
-- [How much does it cost?](#how-much-does-it-cost)
-- [What runs where](#what-runs-where)
-- [Local development](#local-development)
+- [Path A — deploy everything (Terraform creates a new VM)](#path-a--deploy-everything-terraform-creates-a-new-vm)
+- [Path B — use an existing Ubuntu VM you already own](#path-b--use-an-existing-ubuntu-vm-you-already-own)
+- [Configuring the SKUs to buy](#configuring-the-skus-to-buy)
+- [Using the dashboard](#using-the-dashboard)
+- [The buying strategy in one paragraph](#the-buying-strategy-in-one-paragraph)
+- [Costs](#costs)
+- [Uninstall / cleanup](#uninstall--cleanup)
 - [Troubleshooting](#troubleshooting)
-- [Tearing it down](#tearing-it-down)
 
 ---
 
 ## What it does
 
-- Runs an **Azure Function** on a **timer** at the top of every hour.
-- On each run, for every SKU target you configured:
-  1. Reads what Azure currently has (`instanceView.currentCapacity`).
-  2. If the reservation is in a `Failed` state → restores it to a healthy number.
-  3. If the target isn't reached yet → tries to buy more with a **halving degrade sequence** (e.g. tries 50, then 25, then 12, then 6, then 3, then 1).
-  4. After every success it keeps chipping within the same hour, so you can get multiple partial fulfilments in one run.
-- Persists everything in **two Azure Storage tables**:
-  - `crState` — one row per SKU with current progress.
-  - `crAttempts` — append-only audit log of every API call.
-- Exposes an **HTML dashboard** so you can see progress at a glance, and a **JSON endpoint** for scripting.
+- Every hour an **Azure Automation runbook** (PowerShell 7.2) tries to reach a target of *N* instances for each configured VM SKU, in each configured region.
+- If Azure can't give you the full amount, the runbook halves: asks for `N/2`, then `N/4`, … down to `1`. After every success it keeps chipping toward the target within the same run.
+- If a `PATCH` puts the reservation into a `Failed` state, the runbook auto-restores it to the last healthy capacity — no manual intervention.
+- A small dashboard renders live progress cards + a per-job history table, colour-coded by outcome (Target reached / Already reserved / Restored / No capacity / Failed).
+- State lives entirely in Azure objects (reservations + Automation job history). **No storage account, no database, no private endpoints.**
 
 ---
 
 ## Architecture
 
 ```
-Azure subscription
-│
-├── Resource group: crbot-app-rg
-│   ├── Storage account (state tables + Function's own runtime storage)
-│   ├── Log Analytics workspace + Application Insights (logs & telemetry)
-│   └── Function App (Flex Consumption, Python 3.11, system-assigned MI)
-│         ├── Timer trigger  "hourly_buy"     ← runs every hour
-│         ├── HTTP POST      /api/run          ← manual trigger (key-protected)
-│         ├── HTTP GET       /api/state        ← JSON state
-│         └── HTTP GET       /api/dashboard    ← HTML dashboard
-│
-└── Resource group: crbot-reservations-rg
-    └── Capacity Reservation Group "cr-group-we" (regional, West Europe)
-          ├── cr-standard-nv6ads-a10-v5     ← grows toward 50
-          └── cr-standard-nv18ads-a10-v5    ← grows toward 9
+Reservations RG
+ └── One Capacity Reservation Group per region
+      └── One reservation per configured SKU
+           (grows toward its target over time)
+
+App RG
+ ├── Automation Account (system-assigned managed identity)
+ │    ├── runbook: buy-reservations.ps1
+ │    ├── hourly schedule + job schedule link
+ │    └── Automation Variables: CR-SubscriptionId, CR-ResourceGroup,
+ │                              CR-Location, CR-GroupPrefix, CR-Targets
+ └── Ubuntu VM (either newly created or one you already own)
+      ├── System-assigned MI
+      │    ├── Reader on Reservations RG
+      │    └── Reader + Automation Operator on Automation Account
+      └── nginx + PowerShell 7 + systemd timer
+           renders /var/www/html/index.html every minute from live ARM
 ```
 
-- Two resource groups so you can delete the **reservations RG** independently when the workload ends, without touching the app or audit history.
-- **Regional CRG** (no zones): Azure picks whichever zone in West Europe has capacity — better odds than pinning to one zone.
-- **System-assigned managed identity**: no keys, no connection strings anywhere in code.
+**RBAC granted by Terraform:**
 
----
-
-## The buying strategy (halving degrade)
-
-Given a "how many more do I need" number `N`, the bot generates a shrinking sequence:
-
-```
-50 → 25 → 12 → 6 → 3 → 1
-```
-
-For each value in the sequence it makes one API call. Behaviour depends on whether the reservation already exists:
-
-- **First run for a SKU (create):** first quantity Azure accepts becomes the reservation size.
-- **Subsequent runs (update / PATCH):** first delta Azure accepts is added to the existing capacity, then the loop **continues** with a smaller target — because a partial success doesn't mean the region is out, it just means Azure won't hand out that big a chunk right now.
-- The whole hour ends when the full degrade sequence fails end-to-end, or you hit the target, or the safety cap of 32 iterations is hit.
-
-Failed-state safety: if Azure moves the reservation into `Failed` (rare, but possible during capacity pressure), the bot reads `instanceView.currentCapacity` and PATCHes back to that value so the reservation becomes usable again.
-
----
-
-## Repo layout
-
-```
-capacity reservation/
-├── azure.yaml                     # azd manifest (infra = terraform, service = api)
-├── README.md                      # this file
-├── .gitignore
-├── infra/                         # Terraform module
-│   ├── providers.tf               # azurerm ~> 4.10, random ~> 3.6
-│   ├── variables.tf               # inputs (name_prefix, location, targets, ...)
-│   ├── main.tf                    # RGs, storage, App Insights, Function App, RBAC
-│   ├── outputs.tf                 # values azd surfaces after deploy
-│   └── main.tfvars.json           # defaults (edit here to change targets)
-└── src/                           # Function App code (Python 3.11)
-    ├── function_app.py            # timer + 3 HTTP triggers
-    ├── cr_config.py               # env var parsing
-    ├── cr_manager.py              # buying strategy, Azure Compute calls
-    ├── cr_state.py                # Table Storage state + audit log
-    ├── host.json                  # Functions runtime config
-    ├── requirements.txt           # Python dependencies
-    ├── .funcignore                # files excluded from the deployment package
-    └── local.settings.json.example  # template for local `func start`
-```
+| Identity | Scope | Role |
+|---|---|---|
+| Automation Account MI | Reservations RG | Contributor (creates/updates CRGs + reservations) |
+| Dashboard VM MI | Reservations RG | Reader |
+| Dashboard VM MI | Automation Account | Reader + Automation Operator (to read job output) |
 
 ---
 
 ## Prerequisites
 
-- Azure subscription with permission to create resource groups and assign roles.
-- Quota for the target VM SKUs (capacity reservations still consume quota — check with `az vm list-usage -l westeurope`).
-- Tools installed locally:
-  - **Azure CLI** — `az login`
-  - **Terraform ≥ 1.6** — `terraform version`
-  - **Azure Developer CLI (`azd`) ≥ 1.10** — `azd version`
-  - **Python 3.11** and **Azure Functions Core Tools v4** (only if you want to run locally)
+- An Azure subscription. The signed-in user (you, in Cloud Shell) needs:
+  - **Contributor** on the subscription (or on the two resource groups the tool creates) — to deploy resources.
+  - **User Access Administrator** or **Owner** on those scopes — to assign the RBAC roles above.
+- Enough VM quota in the target region for the SKUs you want to reserve. Capacity reservations count against quota.
+- **Path B only:** an existing Ubuntu 22.04 or 24.04 VM in the same subscription, reachable on port 80 from wherever you'll open the dashboard.
 
 ---
 
-## Deploy
+## Path A — deploy everything (Terraform creates a new VM)
 
-The fastest path uses `azd`:
+Use this when the customer has **no VM available** for the dashboard.
 
-```powershell
-# 1) Sign in
-az login
-azd auth login
+### 1. Open Cloud Shell
 
-# 2) Create an azd environment (names your deployment; used as a suffix)
-azd env new crbot
+Go to https://shell.azure.com/ (or click the `>_` icon at the top of the Azure portal). Choose **Bash**.
 
-# 3) Point azd at your subscription and region
-azd env set AZURE_SUBSCRIPTION_ID <your-subscription-id>
-azd env set AZURE_LOCATION westeurope
+### 2. Confirm you're in the right subscription
 
-# 4) Provision infra AND deploy the Function App code
-azd up
+```bash
+az account show --query "{name:name, id:id}" -o table
+
+# If wrong subscription:
+az account set --subscription "<subscription-name-or-id>"
 ```
 
-At the end `azd` prints something like:
+### 3. Clone the repo
 
-```
-DASHBOARD_URL         = https://crbot-func-a1b2c3d4.azurewebsites.net/api/dashboard
-FUNCTION_APP_NAME     = crbot-func-a1b2c3d4
-AZURE_RESOURCE_GROUP  = crbot-app-rg
-RESERVATIONS_RESOURCE_GROUP = crbot-reservations-rg
+```bash
+git clone https://github.com/esarabadani/on-demand-capacity-reservation-purchase-automation-service.git
+cd on-demand-capacity-reservation-purchase-automation-service/infra
 ```
 
-Open the dashboard URL in a browser. It auto-refreshes every 60 seconds.
+### 4. Configure inputs
 
-### Manual Terraform-only path
+Two required inputs: your public IP (for the NSG allow rule) and a VM admin password.
 
-If you don't want to use `azd`:
+```bash
+export TF_VAR_dashboard_allowed_ip="$(curl -s https://api.ipify.org)/32"
+read -srp "Choose a VM admin password (12-72 chars, upper+lower+digit+symbol): " PW; echo
+export TF_VAR_dashboard_admin_password="$PW"
+```
 
-```powershell
-cd infra
+### 5. Deploy
+
+```bash
 terraform init
-terraform apply `
-  -var="environment_name=crbot" `
-  -var-file=main.tfvars.json
+terraform apply -auto-approve
+```
 
-# Note the FUNCTION_APP_NAME output, then publish the code:
-cd ..\src
-func azure functionapp publish <FUNCTION_APP_NAME> --python
+Takes ~5 minutes. Outputs include `DASHBOARD_URL`. Open it in a browser (only your IP is allowed).
+
+### 6. Trigger a first run (optional)
+
+The scheduled runbook fires at the top of the next hour. If you want progress on the dashboard sooner:
+
+```bash
+AA=$(terraform output -raw AUTOMATION_ACCOUNT)
+RG=$(terraform output -raw AZURE_RESOURCE_GROUP)
+az automation runbook start --automation-account-name "$AA" --resource-group "$RG" --name buy-reservations
 ```
 
 ---
 
-## Configure
+## Path B — use an existing Ubuntu VM you already own
 
-Everything you'd normally want to change lives in [infra/main.tfvars.json](infra/main.tfvars.json):
+Use this when the customer says **"I already have a VM, don't create one."**
 
-```json
-{
-  "name_prefix": "crbot",
-  "location": "westeurope",
-  "reservations_location": "westeurope",
-  "capacity_reservation_group_name": "cr-group-we",
-  "targets": [
-    { "sku": "Standard_NV6ads_A10_v5",  "quantity": 50 },
-    { "sku": "Standard_NV18ads_A10_v5", "quantity": 9  }
+### 1. Open Cloud Shell (same as above)
+
+### 2. Find your VM's resource ID
+
+```bash
+VM_RG="<your-vm's-resource-group>"
+VM_NAME="<your-vm's-name>"
+VM_ID=$(az vm show --name "$VM_NAME" --resource-group "$VM_RG" --query id -o tsv)
+echo "VM ID: $VM_ID"
+```
+
+### 3. Enable a system-assigned managed identity on the VM
+
+Terraform needs the MI's principal ID to grant it RBAC roles.
+
+```bash
+VM_PRINCIPAL_ID=$(az vm identity assign --ids "$VM_ID" --query systemAssignedIdentity -o tsv)
+echo "VM MI principal ID: $VM_PRINCIPAL_ID"
+```
+
+*(If a MI already exists, this command is idempotent and just returns it.)*
+
+### 4. Clone the repo
+
+```bash
+git clone https://github.com/esarabadani/on-demand-capacity-reservation-purchase-automation-service.git
+cd on-demand-capacity-reservation-purchase-automation-service/infra
+```
+
+### 5. Deploy (existing-VM mode)
+
+```bash
+export TF_VAR_use_existing_vm=true
+export TF_VAR_existing_vm_resource_id="$VM_ID"
+export TF_VAR_existing_vm_principal_id="$VM_PRINCIPAL_ID"
+
+terraform init
+terraform apply -auto-approve
+```
+
+Takes ~3 minutes (no VM to create).
+
+### 6. Install the dashboard software on your VM
+
+Terraform prints a ready-to-run command as `BOOTSTRAP_COMMAND`:
+
+```bash
+eval "$(terraform output -raw BOOTSTRAP_COMMAND)"
+```
+
+That command:
+1. Downloads `bootstrap-vm.sh` from the repo.
+2. Runs it on your VM via `az vm run-command invoke` (no SSH needed).
+3. The script installs nginx + PowerShell 7 + the render script + a systemd timer, then writes `/etc/crbot/dashboard.env` and starts everything.
+
+Takes another ~3-5 minutes (PowerShell modules are slow to install).
+
+### 7. Open port 80 to your IP
+
+If your VM's NSG doesn't already allow inbound HTTP from your address:
+
+```bash
+MY_IP="$(curl -s https://api.ipify.org)/32"
+VM_NIC=$(az vm show --ids "$VM_ID" --query "networkProfile.networkInterfaces[0].id" -o tsv)
+VM_SUBNET=$(az network nic show --ids "$VM_NIC" --query "ipConfigurations[0].subnet.id" -o tsv)
+NSG_ID=$(az network vnet subnet show --ids "$VM_SUBNET" --query "networkSecurityGroup.id" -o tsv)
+if [[ -n "$NSG_ID" ]]; then
+  az network nsg rule create --nsg-name "$(basename $NSG_ID)" --resource-group "$(echo $NSG_ID | cut -d/ -f5)" \
+    --name AllowCrbotHttp --priority 200 --direction Inbound --access Allow \
+    --protocol Tcp --source-address-prefixes "$MY_IP" --destination-port-ranges 80
+fi
+```
+
+### 8. Visit the dashboard
+
+```bash
+VM_IP=$(az vm show --ids "$VM_ID" -d --query publicIps -o tsv)
+echo "Dashboard: http://${VM_IP}/"
+```
+
+If your VM has no public IP, use its private IP via VPN or the Azure Bastion — the dashboard is a plain HTTP page nginx serves on port 80.
+
+---
+
+## Configuring the SKUs to buy
+
+Edit `infra/variables.tf` (`targets` variable):
+
+```hcl
+variable "targets" {
+  default = [
+    { sku = "Standard_D2as_v7",  quantity = 5, region = "germanywestcentral" },
+    { sku = "Standard_D2ads_v7", quantity = 3, region = "germanywestcentral" },
+    # add more here
   ]
 }
 ```
 
-- `targets` — add or remove SKUs as needed. Each SKU becomes one reservation. The bot chases each target independently.
-- `name_prefix` — short prefix used in every resource name. Change if you want to run more than one bot in the same subscription.
-- Regions — the app can live in a different region than the reservations if you want, but there's no reason to complicate things.
+- `sku` — full VM size string (must be capacity-reservation-eligible; see `az vm list-skus`).
+- `quantity` — total instances you eventually want reserved.
+- `region` — optional; falls back to `reservations_location` (default: germanywestcentral).
 
-After editing, `azd up` again to apply.
+Then re-apply:
 
-### Change the schedule
-
-The timer uses NCRONTAB. Currently every hour on the hour:
-
-```python
-@app.timer_trigger(schedule="0 0 * * * *", ...)   # see src/function_app.py
+```bash
+terraform apply -auto-approve
 ```
 
-- `0 */30 * * * *` = every 30 minutes
-- `0 0 */2 * * *` = every 2 hours
-- `0 15 * * * *`  = at :15 of every hour
-
-Redeploy after changing.
+The runbook picks up the new list on its next scheduled run (or you can trigger it manually as in step 6 above).
 
 ---
 
-## Using it
+## Using the dashboard
 
-### Dashboard
+Cards at the top:
+- **N / M** — current reserved vs target.
+- Green **All reserved** pill when at target, amber **Partially reserved** when growing, grey **Not created yet** before the first run.
 
-Open `DASHBOARD_URL`. You'll see:
+Recent runbook jobs table (bottom):
+- One row **per SKU per job**.
+- **Outcome** column:
+  - **Target reached** — bot bought new capacity this run to hit the target.
+  - **Already reserved** — target was already met on arrival, no work done.
+  - **Restored to healthy state** — a previous PATCH left the reservation `Failed`, this run fixed it.
+  - **No capacity available** — halving sequence failed end-to-end this run.
+  - **Failed** — the runbook itself crashed.
+- **Attempts / Reserved / Failed** — API-call counts per SKU.
+- **Details** — either `capacity now = N` (on success) or the truncated Azure error message.
 
-- **One card per SKU** with progress bar, `confirmed / target`, last outcome, last error.
-- **"Recent attempts"** — audit log tail showing every API call the bot made, colour-coded by success/failure.
-
-### JSON state (for scripts)
-
-```powershell
-curl https://crbot-func-xxxx.azurewebsites.net/api/state | ConvertFrom-Json
-```
-
-Returns config + per-SKU status + the last 100 attempts.
-
-### Manual trigger
-
-To run the buying cycle right now instead of waiting for the next hour:
-
-```powershell
-# The function key is on the Function App -> App keys -> _master
-$key = az functionapp keys list `
-  --name crbot-func-xxxx `
-  --resource-group crbot-app-rg `
-  --query masterKey -o tsv
-
-curl -X POST "https://crbot-func-xxxx.azurewebsites.net/api/run?code=$key"
-```
-
-Returns a JSON summary of what happened.
+The page auto-refreshes every 60 seconds and reads live from Azure — nothing is cached.
 
 ---
 
-## How much does it cost?
+## The buying strategy in one paragraph
 
-- **Reservations themselves** — you pay the standard on-demand VM rate for each VM instance the bot successfully reserves, whether or not a VM is deployed against it. If the bot gets you 12 out of 50 NV6, you pay for 12 NV6 instance-hours per hour until you either deploy VMs into them or delete the reservation.
-- **Function App (Flex Consumption)** — a few pennies per month at this workload (once-an-hour runs with small dashboard traffic).
-- **Storage account** — fractions of a cent per month.
-- **App Insights** — a few pennies per month at default sampling.
-
-**Total infra cost when idle: ~$1–2/month.** All the money is in the reservations you actually acquire.
-
-Reserved Instances / Savings Plans automatically apply to matching on-demand capacity reservations, so those discounts stack normally.
+Every hour, for each configured SKU, the bot reads what Azure already has and computes `remaining = target − current`. If `remaining > 0`, it asks Azure for `remaining` more instances. If Azure refuses, it halves and tries again (`remaining/2`, `/4`, … `1`). **After every success it starts a fresh round**: recompute `remaining`, ask again. That keeps chipping capacity within a single hour whenever Azure is willing to hand out smaller chunks. If a `PATCH` puts the reservation into `Failed` state (rare but possible during capacity pressure), the bot restores it to its last healthy capacity in the same run before trying smaller sizes. When either the target is reached or an entire halving sequence returns nothing, the runbook exits and waits for the next hour.
 
 ---
 
-## What runs where
+## Costs
 
-| Concern | Where |
-|---|---|
-| Hourly buying attempts | Function App timer trigger, top of every hour |
-| Progress state | `crState` table in the storage account (one row per SKU) |
-| Audit log | `crAttempts` table (one row per API call, partitioned by day) |
-| Logs & traces | Application Insights → Log Analytics workspace |
-| Buy authority | Function App's managed identity, with **Contributor** on the reservations RG only |
-| Storage authority | Same MI with **Storage Blob Data Owner / Queue Data Contributor / Table Data Contributor** on the storage account only |
+Rough monthly Germany West Central estimates, USD:
 
-No secrets, no connection strings, no service principal passwords are ever created or stored.
+| Resource | Cost/month | Notes |
+|---|---|---|
+| Automation Account | free | Runbook execution minutes at these volumes are within the free tier. |
+| Runbook job hosting | ~$0.05 | ~30 minutes/month of PowerShell 7.2 execution. |
+| New dashboard VM (Path A only) | ~$60 | `Standard_D2as_v7` running 24/7. Reduce with `vm_size` variable. |
+| Public IP for new VM (Path A only) | ~$3.60 | Standard SKU, static. |
+| **Capacity reservations themselves** | **PAYG rate of each reserved VM size × 730h** | You pay for every instance you actually manage to reserve, whether or not a VM is attached. |
+
+**The last row is the big number** — reserving 5 × `Standard_D2as_v7` is roughly 5 × their hourly rate × 730 hours. Reserved-Instance discounts you already have will offset that.
 
 ---
 
-## Local development
+## Uninstall / cleanup
 
-```powershell
-cd src
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+**Path A (Terraform created the VM):**
 
-# Copy the template and fill in real values (your subscription id, existing RG,
-# storage account you have access to).
-Copy-Item local.settings.json.example local.settings.json
-notepad local.settings.json
-
-# Start the Function host (needs Azurite for local storage emulation)
-func start
+```bash
+cd on-demand-capacity-reservation-purchase-automation-service/infra
+terraform destroy -auto-approve
 ```
 
-Then hit:
+That deletes the app RG (VM, nginx, Automation) and the reservations RG (all reservations — you stop paying immediately).
 
-- `POST http://localhost:7071/api/run` to trigger the buy cycle
-- `GET  http://localhost:7071/api/dashboard` to open the dashboard
-- `GET  http://localhost:7071/api/state` to see the JSON
+**Path B (existing VM):**
 
-`DefaultAzureCredential` locally uses whatever you're signed in with (VS Code, `az login`, environment variables).
+Terraform destroys everything it created (Automation + role assignments), but **your VM stays, still running nginx + the timer.** To wipe it:
+
+```bash
+# On your VM (over SSH or Cloud Shell run-command):
+sudo systemctl disable --now crbot-dashboard.timer crbot-dashboard.service
+sudo rm -rf /opt/crbot /etc/crbot
+sudo rm -f /etc/systemd/system/crbot-dashboard.service /etc/systemd/system/crbot-dashboard.timer
+sudo rm -f /etc/nginx/sites-enabled/crbot /etc/nginx/sites-available/crbot
+sudo systemctl reload nginx
+```
+
+Then either:
+
+```bash
+# Reservations only:
+az group delete --name crbot-reservations-rg --yes
+
+# All Terraform-created infra:
+terraform destroy -auto-approve
+```
 
 ---
 
 ## Troubleshooting
 
-**The dashboard shows `remaining` = target but no attempts appear**
-Timer hasn't run yet. Trigger a manual run (see above) or wait for the next hour. First timer fire is at the next `HH:00:00` after deployment.
+### Dashboard shows the "Booting..." placeholder for more than 5 minutes
 
-**Attempts show `AuthorizationFailed` or `Insufficient Privileges`**
-The Function's managed identity is missing role assignments. `terraform apply` should have set them; check the RG's IAM blade. The MI needs Contributor on the reservations RG.
+On the VM check `/var/log/cloud-init-output.log` (Path A) or the run-command output from step 6 (Path B). Most common cause: the `Az.*` PowerShell modules failed to install because of a proxy or restricted egress. Fix by running the install command yourself:
 
-**Attempts show `OperationNotAllowed` with a capacity message**
-That's the expected "no capacity" answer. The bot will keep trying smaller quantities in the same run and try again next hour.
-
-**Attempts show `QuotaExceeded`**
-You need more subscription quota for the VM family. Capacity reservations still count against quota. Request a quota increase in the portal for the target VM family in your region.
-
-**Reservation shows `provisioningState = Failed`**
-Azure couldn't fulfil an increase and left the reservation in a bad state. The bot will auto-restore it on the next run by reading `instanceView.currentCapacity` and PATCHing back to that value.
-
-**Function App logs**
-Look in Application Insights → `traces`, or run:
-
-```powershell
-az functionapp logs tail --name crbot-func-xxxx --resource-group crbot-app-rg
+```bash
+sudo pwsh -Command "Install-Module Az.Accounts, Az.Compute, Az.Automation -Force -Scope AllUsers"
+sudo systemctl start crbot-dashboard.service
 ```
+
+### Runbook status stuck on `Running` for hours
+
+Should not happen with the current code (the runbook calls `Disconnect-AzAccount` + `exit 0`). If it does, stop it manually in the portal and check for an unhandled exception in a recent code edit.
+
+### Reservation says `Failed` state in the portal
+
+Not urgent. Your existing capacity is still yours. The next hourly run will restore it automatically. If you want it fixed now, start the runbook manually (see Path A step 6).
+
+### Cloud Shell command `az vm run-command invoke ... --scripts @/tmp/crbot-bootstrap.sh` returns quickly with `Enable succeeded` but the dashboard is still the placeholder
+
+Wait 3-5 minutes — the run-command finishes when it *dispatches* the script, not when the script itself finishes. The `Az.*` PowerShell module install is what takes the time.
+
+### Can't reach the dashboard from your browser but `curl` from Cloud Shell works
+
+Your browser is likely egressing from a different public IP than the shell (VPN, split tunnel, etc.). Add that IP to the NSG rule or re-run step 4 with your browser's IP.
 
 ---
 
-## Tearing it down
-
-To stop paying for anything:
-
-```powershell
-# Deletes ALL resources this project created:
-azd down --purge
-```
-
-Or, more selectively:
-
-```powershell
-# Just stop the reservations (keeps the bot around):
-az group delete --name crbot-reservations-rg --yes
-
-# Or just stop the bot (keeps whatever reservations exist):
-az group delete --name crbot-app-rg --yes
-```
-
-Once the reservations RG is deleted, hourly bills for reserved capacity stop.
+**Questions or issues?** Open a GitHub issue on this repo.

@@ -1,0 +1,13 @@
+# Systemd service unit that regenerates the dashboard HTML.
+# Runs once, then the paired timer fires it on a schedule.
+# EnvironmentFile is populated by cloud-init.
+
+[Unit]
+Description=Render Capacity Reservation Dashboard HTML
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=/etc/crbot/dashboard.env
+ExecStart=/usr/bin/pwsh -NoProfile -File /opt/crbot/render-dashboard.ps1

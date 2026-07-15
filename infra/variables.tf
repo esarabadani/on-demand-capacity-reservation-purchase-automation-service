@@ -1,72 +1,109 @@
-# =============================================================================
-# variables.tf
-#
-# All input variables for the module live here. Defaults are set so that
-# `terraform apply` works out of the box for the West Europe scenario the
-# repo is built around. `main.tfvars.json` overrides these values in a
-# machine-readable way that azd is happy with.
-# =============================================================================
+# ------------------------------------------------------------------------------
+# variables.tf - inputs for the capacity-reservation-bot Terraform module.
+# ------------------------------------------------------------------------------
 
-# azd sets this automatically from the current environment name (`azd env new
-# <name>`). We use it as a suffix so a single subscription can host multiple
-# instances (dev, staging, ...) side by side without name collisions.
-variable "environment_name" {
-  description = "azd environment name (used as a suffix for resource names)."
-  type        = string
-}
-
-# Region for the Function App, storage, log analytics, App Insights.
-# NOT the region for the reservations - that's `reservations_location` below.
-variable "location" {
-  description = "Region for the Function App and its supporting resources."
-  type        = string
-  default     = "westeurope"
-}
-
-# Short prefix that all resource names start with, e.g. "crbot" -> "crbot-func-*".
-# Kept short because Azure has 24-char caps on storage-account names.
 variable "name_prefix" {
-  description = "Short lowercase prefix for all resources (3-16 chars)."
+  description = "Short prefix (3-16 chars, lowercase) used in every resource name."
   type        = string
   default     = "crbot"
 
-  # Terraform validation block enforces this at plan time - no waiting for
-  # Azure to reject an invalid name.
   validation {
     condition     = length(var.name_prefix) >= 3 && length(var.name_prefix) <= 16
     error_message = "name_prefix must be 3-16 characters."
   }
 }
 
-# Where the actual capacity reservations will be purchased. Usually the same
-# as `location`, but they don't have to be. Only regions with the target VM
-# SKUs are valid.
+variable "location" {
+  description = "Region for the Automation Account, VM, VNet, and their RG."
+  type        = string
+  default     = "germanywestcentral"
+}
+
 variable "reservations_location" {
-  description = "Region where capacity reservations will be purchased."
+  description = "Default region for capacity reservations. Used when a target does not set its own `region`."
   type        = string
-  default     = "westeurope"
+  default     = "germanywestcentral"
 }
 
-# Name of the Capacity Reservation Group (CRG). The CRG is a container -
-# no cost, no capacity, just a labelled shelf that holds the per-SKU
-# reservations. Passed to the Function App as CR_GROUP_NAME.
-variable "capacity_reservation_group_name" {
-  description = "Name of the Capacity Reservation Group (CRG) that will hold the reservations."
+variable "capacity_reservation_group_prefix" {
+  description = "Prefix for the Capacity Reservation Groups. Actual CRG name = `<prefix>-<region>`, so multiple regions each get their own CRG."
   type        = string
-  default     = "cr-group-we"
+  default     = "cr-group"
 }
 
-# The list of (SKU, quantity) targets the bot chases every hour. Encoded as
-# JSON when passed to the Function App as CR_TARGETS.
-# Add more entries here to reserve additional VM sizes.
 variable "targets" {
-  description = "Target SKUs and desired quantities. The bot will keep trying to reach these totals."
+  description = <<-EOT
+    SKU targets. The bot tries to grow each reservation up to `quantity`.
+    Each target can pick its own region — if `region` is null, the target
+    inherits `reservations_location`. Regions are independent: two SKUs in
+    different regions land in two different CRGs.
+  EOT
   type = list(object({
     sku      = string
     quantity = number
+    region   = optional(string)
   }))
   default = [
-    { sku = "Standard_NV6ads_A10_v5", quantity = 50 },
-    { sku = "Standard_NV18ads_A10_v5", quantity = 9 }
+    { sku = "Standard_D2as_v7", quantity = 5, region = "germanywestcentral" },
+    { sku = "Standard_D2ads_v7", quantity = 3, region = "germanywestcentral" }
   ]
+}
+
+variable "runbook_schedule_hours" {
+  description = "How often the runbook runs. 1 = every hour."
+  type        = number
+  default     = 1
+}
+
+# ---- Dashboard VM ----
+variable "use_existing_vm" {
+  description = <<-EOT
+    Choose between two dashboard hosting modes:
+      false = Terraform creates a fresh Ubuntu VM (with public IP + NSG) and installs everything via cloud-init.
+      true  = Skip VM creation. You bring an existing Ubuntu VM. Terraform still grants that VM's managed identity the RBAC it needs. After apply, you run the printed `az vm run-command` to install nginx + PowerShell + the dashboard on your VM.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "existing_vm_resource_id" {
+  description = "Full resource ID of the existing Ubuntu VM. Required when use_existing_vm=true. Get with: az vm show --name <vm> --resource-group <rg> --query id -o tsv"
+  type        = string
+  default     = ""
+}
+
+variable "existing_vm_principal_id" {
+  description = "Object ID of the existing VM's system-assigned managed identity. Required when use_existing_vm=true. Enable + get it with: az vm identity assign --ids <vm-id> --query systemAssignedIdentity -o tsv"
+  type        = string
+  default     = ""
+}
+
+variable "dashboard_admin_username" {
+  description = "Admin username for the new VM. Ignored when use_existing_vm=true."
+  type        = string
+  default     = "azureuser"
+}
+
+variable "dashboard_admin_password" {
+  description = "Admin password for the new VM (12-72 chars, must satisfy Azure complexity: upper, lower, digit, symbol). Ignored when use_existing_vm=true; supply any placeholder in that case."
+  type        = string
+  sensitive   = true
+  default     = "NotUsed-IfExistingVm-1234!"
+
+  validation {
+    condition     = length(var.dashboard_admin_password) >= 12 && length(var.dashboard_admin_password) <= 72
+    error_message = "dashboard_admin_password must be 12-72 characters long."
+  }
+}
+
+variable "dashboard_allowed_ip" {
+  description = "Public IP (in CIDR form, e.g. '203.0.113.42/32') allowed to reach the new VM on ports 22 and 80. Ignored when use_existing_vm=true."
+  type        = string
+  default     = "0.0.0.0/32"
+}
+
+variable "vm_size" {
+  description = "VM size for the new dashboard VM. Ignored when use_existing_vm=true."
+  type        = string
+  default     = "Standard_D2as_v7"
 }
