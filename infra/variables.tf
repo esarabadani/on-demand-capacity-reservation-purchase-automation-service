@@ -44,8 +44,8 @@ variable "targets" {
     region   = optional(string)
   }))
   default = [
-    { sku = "Standard_D2as_v7", quantity = 5, region = "germanywestcentral" },
-    { sku = "Standard_D2ads_v7", quantity = 3, region = "germanywestcentral" }
+    { sku = "Standard_D2as_v7", quantity = 5, region = "westeurope" },
+    { sku = "Standard_D2ads_v7", quantity = 3, region = "westeurope" }
   ]
 }
 
